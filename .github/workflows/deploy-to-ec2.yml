@@ -2,7 +2,7 @@ name: Deploy index.html to EC2
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main ]   # change if needed
 
 jobs:
   deploy:
@@ -11,30 +11,113 @@ jobs:
       HOST: ${{ secrets.EC2_HOST }}
       USER: ${{ secrets.EC2_USER }}
       KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      PORT: ${{ secrets.EC2_PORT }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup SSH
+      - name: Ensure index.html exists
+        run: |
+          if [ ! -f index.html ]; then
+            echo "index.html not found in repo root" && exit 1
+          fi
+
+      - name: Prepare SSH
         run: |
           mkdir -p ~/.ssh
-          echo "$KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+          chmod 700 ~/.ssh
+          # add host key to known_hosts to avoid prompt
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts || true
+          chmod 644 ~/.ssh/known_hosts
 
-      - name: Copy index.html
-        run: scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa index.html $USER@$HOST:/tmp/index.html
-
-      - name: Deploy to NGINX root
+      - name: Add private key and test SSH
         run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa $USER@$HOST <<'EOF'
+          printf '%s\n' "$KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+
+          # optional port handling for ssh (ssh uses -p)
+          SSH_PORT_FLAG=""
+          if [ -n "$PORT" ]; then SSH_PORT_FLAG="-p $PORT"; fi
+
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes $SSH_PORT_FLAG $USER@"$HOST" 'echo "ssh-ok"' || (echo "SSH test failed" && exit 1)
+
+      - name: Upload index.html to remote /tmp
+        run: |
+          SCP_PORT_FLAG=""
+          if [ -n "$PORT" ]; then SCP_PORT_FLAG="-P $PORT"; fi
+          scp $SCP_PORT_FLAG -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts index.html ${USER}@${HOST}:/tmp/index.html
+
+      - name: Deploy on remote (install nginx if needed, detect root, move file)
+        run: |
+          SSH_PORT_FLAG=""
+          if [ -n "$PORT" ]; then SSH_PORT_FLAG="-p $PORT"; fi
+
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts $SSH_PORT_FLAG ${USER}@${HOST} bash -s <<'EOF'
             set -e
-            sudo apt update -y
-            sudo apt install -y nginx
-            ROOT=$(awk '/server {/,/}/ {if ($1=="root"){gsub(/;/,"",$2);print $2;exit}}' <(sudo nginx -T 2>/dev/null) || echo /var/www/html)
-            sudo mv /tmp/index.html $ROOT/index.html
-            sudo systemctl enable nginx
-            sudo systemctl restart nginx
+
+            # Install nginx if missing (debian/ubuntu or yum/dnf)
+            if ! command -v nginx >/dev/null 2>&1; then
+              if [ -f /etc/debian_version ]; then
+                sudo apt-get update -y
+                sudo apt-get install -y nginx
+              else
+                if command -v yum >/dev/null 2>&1; then
+                  sudo yum install -y nginx || true
+                elif command -v dnf >/dev/null 2>&1; then
+                  sudo dnf install -y nginx || true
+                fi
+              fi
+            fi
+
+            # Detect nginx web root from config, fallback to common paths
+            ROOT=$(sudo nginx -T 2>/dev/null | awk '/server {/,/}/ { if ($1=="root") {gsub(/;/,"",$2); print $2; exit} }' || true)
+            if [ -z "$ROOT" ]; then
+              for p in /var/www/html /usr/share/nginx/html /srv/www; do
+                if [ -d "$p" ]; then ROOT="$p"; break; fi
+              done
+            fi
+            if [ -z "$ROOT" ]; then echo "Could not determine nginx root" >&2; exit 1; fi
+            echo "Using web root: $ROOT"
+
+            sudo mkdir -p "$ROOT"
+            sudo chown root:root "$ROOT"
+            sudo chmod 755 "$ROOT"
+
+            if [ -f /tmp/index.html ]; then
+              sudo mv -f /tmp/index.html "$ROOT/index.html"
+            elif [ -f /var/www/html/index.html ]; then
+              sudo mv -f /var/www/html/index.html "$ROOT/index.html"
+            else
+              echo "index.html not found on remote (expected /tmp/index.html or /var/www/html/index.html)" >&2
+              exit 2
+            fi
+
+            sudo chown root:root "$ROOT/index.html"
+            sudo chmod 644 "$ROOT/index.html"
+
+            # start/restart nginx
+            if command -v systemctl >/dev/null 2>&1; then
+              sudo systemctl enable nginx || true
+              sudo systemctl restart nginx
+            else
+              sudo service nginx restart || true
+            fi
+
+            # local check
+            echo "Local HTTP status:"
+            curl -s -I http://127.0.0.1/ | head -n 1 || true
+            echo "Deployed index.html to $ROOT"
           EOF
 
-
+      - name: Quick external check (best effort)
+        run: |
+          SITE="http://${HOST}/"
+          echo "Checking $SITE"
+          if curl -s --max-time 10 "${SITE}" | grep -i "Welcome to DevOps Stage 0" >/dev/null 2>&1 ; then
+            echo "Site returned expected content."
+          else
+            echo "Site did not return expected content (or curl timed out). Check http://${HOST}/ in a browser."
+          fi
 
