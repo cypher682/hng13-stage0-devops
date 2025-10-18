@@ -1,10 +1,3 @@
-``
-
-on:
-  push:
-    branches:
-      - main  # or your release branch
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -12,52 +5,43 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Ensure known_hosts (avoid interactive SSH host check)
+      - name: Add host to known_hosts
         env:
           HOST: ${{ secrets.EC2_HOST }}
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts || true
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Start ssh-agent and add key
-        uses: webfactory/ssh-agent@v0.8.1
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Copy index.html to EC2 /tmp (scp)
+      - name: Add SSH private key and start agent (no external action)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -P 22 index.html ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/index.html
+          mkdir -p ~/.ssh
+          # write the private key from secret to file
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # start ssh-agent and add the key
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+
+          # optional: test key works (will fail the job if something wrong)
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -i ~/.ssh/id_rsa -o BatchMode=yes ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} 'echo SSH OK' || (echo "SSH test failed" && exit 1)
+
+      - name: Copy index.html to EC2
+        run: |
+          scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts index.html ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/index.html
 
       - name: Install nginx & move file into /var/www/html (remote)
         run: |
           ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            # become root / install nginx if missing
             if ! command -v nginx >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y nginx
             fi
-
-            # ensure /var/www/html exists and is writable
             sudo mkdir -p /var/www/html
-            sudo chown root:root /var/www/html
-            sudo chmod 755 /var/www/html
-
-            # move the deployed file into place (overwrite)
             sudo mv /tmp/index.html /var/www/html/index.html
-
-            # ensure nginx runs and listens on 80
             sudo systemctl enable nginx
             sudo systemctl restart nginx
-
-            # open firewall (ufw) if present
-            if command -v ufw >/dev/null 2>&1; then
-              sudo ufw allow 80/tcp || true
-            fi
-
-            # quick health-check output
-            echo "NGINX status:"
-            sudo systemctl status nginx --no-pager
           EOF
-
-
