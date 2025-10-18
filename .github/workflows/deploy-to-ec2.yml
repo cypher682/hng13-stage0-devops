@@ -1,47 +1,138 @@
+name: Deploy index.html to EC2 (NGINX)
+
+on:
+  push:
+    branches:
+      - main    # change if you deploy from another branch
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      HOST: ${{ secrets.EC2_HOST }}
+      USER: ${{ secrets.EC2_USER }}
+      KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      PORT: ${{ secrets.EC2_PORT }}
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Add host to known_hosts
-        env:
-          HOST: ${{ secrets.EC2_HOST }}
+      - name: Fail early if index.html missing
+        run: |
+          if [ ! -f index.html ]; then
+            echo "index.html not found in repo root. Aborting."
+            exit 1
+          fi
+
+      - name: Prepare ~/.ssh and known_hosts
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+          chmod 700 ~/.ssh
+          # add host key to known_hosts (safe no prompt)
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts || true
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Add SSH private key and start agent (no external action)
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Write private key and add to ssh-agent (no external action)
         run: |
-          mkdir -p ~/.ssh
-          # write the private key from secret to file
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          # write key
+          printf '%s\n' "$KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
 
-          # start ssh-agent and add the key
+          # start agent and add key
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/id_rsa
 
-          # optional: test key works (will fail the job if something wrong)
-          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts -i ~/.ssh/id_rsa -o BatchMode=yes ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} 'echo SSH OK' || (echo "SSH test failed" && exit 1)
+          # verify ssh connectivity (non-interactive)
+          PORTFLAG=""
+          if [ -n "$PORT" ]; then PORTFLAG="-p $PORT"; fi
 
-      - name: Copy index.html to EC2
-        run: |
-          scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts index.html ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/index.html
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes $PORTFLAG $USER@"$HOST" 'echo "ssh-ok"' || (echo "SSH connectivity test failed" && exit 1)
 
-      - name: Install nginx & move file into /var/www/html (remote)
+      - name: Upload index.html to /tmp on remote
         run: |
-          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            if ! command -v nginx >/dev/null 2>&1; then
-              sudo apt-get update -y
-              sudo apt-get install -y nginx
+          PORTFLAG=""
+          if [ -n "$PORT" ]; then PORTFLAG="-P $PORT"; fi
+
+          scp $PORTFLAG -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts index.html ${USER}@${HOST}:/tmp/index.html
+
+      - name: Install/start NGINX and move file into /var/www/html (remote)
+        run: |
+          PORTFLAG=""
+          if [ -n "$PORT" ]; then PORTFLAG="-p $PORT"; fi
+
+          ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts $PORTFLAG ${USER}@${HOST} bash -s <<'EOF'
+            set -e
+
+            # Determine distro and appropriate package manager
+            if [ -f /etc/os-release ]; then
+              . /etc/os-release
+              DISTRO_ID=${ID:-unknown}
+            else
+              DISTRO_ID="unknown"
             fi
+
+            # install nginx if missing
+            if ! command -v nginx >/dev/null 2>&1; then
+              if [ "$DISTRO_ID" = "ubuntu" ] || [ "$DISTRO_ID" = "debian" ]; then
+                sudo apt-get update -y
+                sudo apt-get install -y nginx
+              elif [ "$DISTRO_ID" = "amzn" ] || [ "$DISTRO_ID" = "amazon" ] || [ "$DISTRO_ID" = "fedora" ] || [ "$DISTRO_ID" = "centos" ]; then
+                # Amazon Linux / RHEL family
+                if command -v yum >/dev/null 2>&1; then
+                  sudo yum install -y nginx || true
+                fi
+                if command -v dnf >/dev/null 2>&1; then
+                  sudo dnf install -y nginx || true
+                fi
+              else
+                # fallback to apt-get
+                sudo apt-get update -y || true
+                sudo apt-get install -y nginx || true
+              fi
+            fi
+
+            # Ensure the web root exists and permissions are reasonable
             sudo mkdir -p /var/www/html
-            sudo mv /tmp/index.html /var/www/html/index.html
-            sudo systemctl enable nginx
-            sudo systemctl restart nginx
+            sudo chown root:root /var/www/html
+            sudo chmod 755 /var/www/html
+
+            # move uploaded file into place (overwrite)
+            if [ -f /tmp/index.html ]; then
+              sudo mv /tmp/index.html /var/www/html/index.html
+            else
+              echo "/tmp/index.html not found on remote. Aborting."
+              exit 1
+            fi
+
+            # ensure nginx is enabled and running
+            if command -v systemctl >/dev/null 2>&1; then
+              sudo systemctl enable nginx || true
+              sudo systemctl restart nginx
+            else
+              # SysVinit fallback
+              sudo service nginx restart || true
+            fi
+
+            # open port 80 via ufw if present (harmless if not)
+            if command -v ufw >/dev/null 2>&1; then
+              sudo ufw allow 80/tcp || true
+            fi
+
+            # simple check that nginx serves the file locally
+            if command -v curl >/dev/null 2>&1; then
+              curl -s -I http://127.0.0.1/ | head -n 1
+            fi
+
+            echo "Deployment finished on $(date -u)."
           EOF
+
+      - name: Verify remote site is reachable (external)
+        run: |
+          # quick external check from runner (may fail if security group blocks GitHub Actions IPs)
+          SITE="http://${HOST}/"
+          echo "Checking ${SITE}"
+          if curl -s --max-time 10 "${SITE}" | grep -i "Welcome to DevOps Stage 0" >/dev/null 2>&1 ; then
+            echo "Remote site served expected content."
+          else
+            echo "Warning: remote site did not return expected content or curl timed out. It may still be fine; check http://${HOST}/ in a browser."
+          fi
