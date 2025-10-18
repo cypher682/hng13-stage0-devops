@@ -35,3 +35,4 @@ jobs:
             sudo systemctl enable nginx
             sudo systemctl restart nginx
           EOF
+
